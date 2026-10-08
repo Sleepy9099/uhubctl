@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -332,6 +333,35 @@ static char* rtrim(char* str)
 }
 
 /*
+ * Parse a whole-string integer option value, exit with an error if it is
+ * not a number or is outside of [min, max].
+ */
+
+static long parse_long_opt(const char *name, const char *arg, long min, long max)
+{
+    char *end;
+    errno = 0;
+    long v = strtol(arg, &end, 10);
+    if (errno || end == arg || *end != '\0' || v < min || v > max) {
+        fprintf(stderr, "Invalid %s '%s', must be from %ld to %ld.\n", name, arg, min, max);
+        exit(1);
+    }
+    return v;
+}
+
+static double parse_double_opt(const char *name, const char *arg, double min, double max)
+{
+    char *end;
+    errno = 0;
+    double v = strtod(arg, &end);
+    if (errno || end == arg || *end != '\0' || !(v >= min && v <= max)) {
+        fprintf(stderr, "Invalid %s '%s', must be from %g to %g.\n", name, arg, min, max);
+        exit(1);
+    }
+    return v;
+}
+
+/*
  * Convert port list into bitmap.
  * Following port list specifications are equivalent:
  *   1,3,4,5,11,12,13
@@ -616,9 +646,9 @@ static int get_hub_info(struct libusb_device *dev, struct hub_info *info)
 static int get_port_status(struct libusb_device_handle *devh, int port)
 {
     int rc;
-    struct usb_port_status ust;
+    struct usb_port_status ust = {0, 0};
     if (devh == NULL)
-        return -1;
+        return LIBUSB_ERROR_INVALID_PARAM;
 
     rc = libusb_control_transfer(devh,
         LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS
@@ -630,6 +660,9 @@ static int get_port_status(struct libusb_device_handle *devh, int port)
 
     if (rc < 0) {
         return rc;
+    }
+    if (rc < (int)sizeof(ust)) {
+        return LIBUSB_ERROR_IO; /* short read, status is incomplete */
     }
     return libusb_le16_to_cpu(ust.wPortStatus);
 }
@@ -717,7 +750,7 @@ static int set_port_status_libusb(struct libusb_device_handle *devh, int port, i
             port, NULL, 0, USB_CTRL_GET_TIMEOUT
         );
         if (rc < 0) {
-            perror("Failed to control port power!\n");
+            fprintf(stderr, "Failed to control port %d power: %s\n", port, libusb_error_name(rc));
         }
         if (repeat > 0) {
             sleep_ms(opt_wait);
@@ -841,16 +874,18 @@ static int print_port_status(struct hub_info * hub, int portmask)
     int rc = 0;
     struct libusb_device *dev = hub->dev;
     rc = libusb_open(dev, &devh);
-    if (rc == 0) {
+    if (rc != 0) {
+        fprintf(stderr, "Cannot open hub %s: %s\n", hub->location, libusb_error_name(rc));
+    } else {
         int port;
         for (port = 1; port <= hub->nports; port++) {
             if (portmask > 0 && (portmask & (1 << (port-1))) == 0) continue;
 
             port_status = get_port_status(devh, port);
-            if (port_status == -1) {
+            if (port_status < 0) {
                 fprintf(stderr,
-                    "cannot read port %d status, %s (%d)\n",
-                    port, strerror(errno), errno);
+                    "Cannot read port %d status: %s\n",
+                    port, libusb_error_name(port_status));
                 break;
             }
 
@@ -1011,14 +1046,12 @@ static int usb_find_hubs(void)
                 info.actionable = 0;
             }
         }
-        memcpy(&hubs[hub_count], &info, sizeof(info));
-        if (hub_count < MAX_HUBS) {
-            hub_count++;
-        } else {
+        if (hub_count >= MAX_HUBS) {
             /* That should be impossible - but we don't want to crash! */
-            fprintf(stderr, "Too many hubs!");
+            fprintf(stderr, "Too many hubs, only the first %d are used!\n", MAX_HUBS);
             break;
         }
+        memcpy(&hubs[hub_count++], &info, sizeof(info));
     }
     if (!opt_exact) {
         /* Handle USB2/3 duality: */
@@ -1174,7 +1207,7 @@ int main(int argc, char *argv[])
             snprintf(opt_location, sizeof(opt_location), "%s", optarg);
             break;
         case 'L':
-            opt_level = atoi(optarg);
+            opt_level = (int)parse_long_opt("level", optarg, 0, MAX_HUB_CHAIN + 1);
             break;
         case 'n':
             snprintf(opt_vendor, sizeof(opt_vendor), "%s", optarg);
@@ -1196,25 +1229,24 @@ int main(int argc, char *argv[])
         case 'a':
             if (!strcasecmp(optarg, "off")   || !strcasecmp(optarg, "0")) {
                 opt_action = POWER_OFF;
-            }
-            if (!strcasecmp(optarg, "on")    || !strcasecmp(optarg, "1")) {
+            } else if (!strcasecmp(optarg, "on")    || !strcasecmp(optarg, "1")) {
                 opt_action = POWER_ON;
-            }
-            if (!strcasecmp(optarg, "cycle") || !strcasecmp(optarg, "2")) {
+            } else if (!strcasecmp(optarg, "cycle") || !strcasecmp(optarg, "2")) {
                 opt_action = POWER_CYCLE;
-            }
-            if (!strcasecmp(optarg, "toggle") || !strcasecmp(optarg, "3")) {
+            } else if (!strcasecmp(optarg, "toggle") || !strcasecmp(optarg, "3")) {
                 opt_action = POWER_TOGGLE;
-            }
-            if (!strcasecmp(optarg, "flash") || !strcasecmp(optarg, "4")) {
+            } else if (!strcasecmp(optarg, "flash") || !strcasecmp(optarg, "4")) {
                 opt_action = POWER_FLASH;
+            } else {
+                fprintf(stderr, "Invalid action '%s', must be off/on/cycle/toggle/flash or 0-4.\n", optarg);
+                exit(1);
             }
             break;
         case 'd':
-            opt_delay = atof(optarg);
+            opt_delay = parse_double_opt("delay", optarg, 0, INT_MAX / 1000);
             break;
         case 'r':
-            opt_repeat = atoi(optarg);
+            opt_repeat = (int)parse_long_opt("repeat", optarg, 1, 1000);
             break;
         case 'f':
             opt_force = 1;
@@ -1239,7 +1271,7 @@ int main(int argc, char *argv[])
             opt_reset = 1;
             break;
         case 'w':
-            opt_wait = atoi(optarg);
+            opt_wait = (int)parse_long_opt("wait", optarg, 0, 60000);
             break;
         case 'v':
             printf("%s\n", PROGRAM_VERSION);
@@ -1332,6 +1364,7 @@ int main(int argc, char *argv[])
         );
         exit(1);
     }
+    int failed = 0; /* set if any port could not be switched */
     int k; /* k=0 for power OFF, k=1 for power ON */
     for (k=0; k<2; k++) { /* up to 2 power actions - off/on */
         if (k == 0 && opt_action == POWER_ON )
@@ -1356,7 +1389,10 @@ int main(int argc, char *argv[])
             }
             struct libusb_device_handle * devh = NULL;
             rc = libusb_open(hubs[i].dev, &devh);
-            if (rc == 0) {
+            if (rc != 0) {
+                fprintf(stderr, "Cannot open hub %s: %s\n", hubs[i].location, libusb_error_name(rc));
+                failed = 1;
+            } else {
                 /* will operate on these ports */
                 int ports = ((1 << hubs[i].nports) - 1) & opt_ports;
                 int should_be_on = k;
@@ -1368,6 +1404,12 @@ int main(int argc, char *argv[])
                 for (port=1; port <= hubs[i].nports; port++) {
                     if ((1 << (port-1)) & ports) {
                         int port_status = get_port_status(devh, port);
+                        if (port_status < 0) {
+                            fprintf(stderr, "Cannot read port %d status: %s\n",
+                                port, libusb_error_name(port_status));
+                            failed = 1;
+                            continue;
+                        }
                         int power_mask = hubs[i].super_speed ? USB_SS_PORT_STAT_POWER
                                                              : USB_PORT_STAT_POWER;
                         int is_on = (port_status & power_mask) != 0;
@@ -1377,7 +1419,8 @@ int main(int argc, char *argv[])
                         }
 
                         if (is_on != should_be_on) {
-                            rc = set_port_status(devh, &hubs[i], port, should_be_on);
+                            if (set_port_status(devh, &hubs[i], port, should_be_on) < 0)
+                                failed = 1;
                         }
                     }
                 }
@@ -1394,7 +1437,7 @@ int main(int argc, char *argv[])
                     printf("Resetting hub...\n");
                     rc = libusb_reset_device(devh);
                     if (rc < 0) {
-                        perror("Reset failed!\n");
+                        fprintf(stderr, "Reset failed: %s\n", libusb_error_name(rc));
                     } else {
                         printf("Reset successful!\n");
                     }
@@ -1405,7 +1448,7 @@ int main(int argc, char *argv[])
         if (k == 0 && (opt_action == POWER_CYCLE || opt_action == POWER_FLASH))
             sleep_ms((int)(opt_delay * 1000));
     }
-    rc = 0;
+    rc = failed ? 1 : 0;
 cleanup:
 #if defined(__linux__) && (LIBUSB_API_VERSION >= 0x01000107)
     if (opt_sysdev && sys_fd >= 0) {
