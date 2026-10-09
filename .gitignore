@@ -1,5 +1,6 @@
 # Executables
 uhubctl
+uhubctl.exe
 
 # Object files
 *.o
@@ -13,3 +14,4 @@ uhubctl
 
 # IDE config dirs
 .*/
+!.github/

@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install libusb
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
+          else brew install libusb pkgconf; fi
+      - run: make CFLAGS="-O2 -Werror"
+      - name: Smoke test
+        run: sh tests/smoke.sh ./uhubctl
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            git make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-pkgconf
+      - run: make CFLAGS="-O2 -Werror"
+      - name: Smoke test
+        run: sh tests/smoke.sh ./uhubctl.exe
+      - name: Package
+        run: |
+          mkdir dist && cp uhubctl.exe /ucrt64/bin/libusb-1.0.dll dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uhubctl-windows-x64
+          path: dist/
