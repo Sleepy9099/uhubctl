@@ -19,7 +19,7 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
           else brew install libusb pkgconf; fi
-      - run: make CFLAGS="-O2 -Werror"
+      - run: CFLAGS="-O2 -Werror" make
       - name: Smoke test
         run: sh tests/smoke.sh ./uhubctl
 
@@ -40,7 +40,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-libusb
             mingw-w64-ucrt-x86_64-pkgconf
-      - run: make CFLAGS="-O2 -Werror"
+      - run: CFLAGS="-O2 -Werror" make
       - name: Smoke test
         run: sh tests/smoke.sh ./uhubctl.exe
       - name: Package
