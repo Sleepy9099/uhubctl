@@ -191,6 +191,12 @@ struct descriptor_strings {
     char product[64];
     char serial[64];
     char description[512];
+    int vid;
+    int pid;
+    int is_hub;     /* 1 if fields below are valid */
+    int bcd_usb;
+    int nports;
+    int lpsm;
 };
 
 struct hub_info {
@@ -230,6 +236,7 @@ static int opt_exact  = 0;  /* exact location match - disable USB3 duality handl
 static int opt_reset  = 0;  /* reset hub after operation(s) */
 static int opt_force  = 0;  /* force operation even on unsupported hubs */
 static int opt_nodesc = 0;  /* skip querying device description */
+static int opt_json   = 0;  /* print status as JSON */
 #if defined(__linux__)
 static int opt_nosysfs = 0; /* don't use the Linux sysfs port disable interface, even if available */
 #if (LIBUSB_API_VERSION >= 0x01000107) /* 1.0.23 */
@@ -242,7 +249,7 @@ static int is_rpi_4b = 0;
 static int is_rpi_5  = 0;
 
 static const char short_options[] =
-    "l:L:n:a:p:d:r:w:s:H:hvefRN"
+    "l:L:n:a:p:d:r:w:s:H:hvefRNj"
 #if defined(__linux__)
     "S"
 #if (LIBUSB_API_VERSION >= 0x01000107) /* 1.0.23 */
@@ -265,6 +272,7 @@ static const struct option long_options[] = {
     { "exact",    no_argument,       NULL, 'e' },
     { "force",    no_argument,       NULL, 'f' },
     { "nodesc",   no_argument,       NULL, 'N' },
+    { "json",     no_argument,       NULL, 'j' },
 #if defined(__linux__)
     { "nosysfs",  no_argument,       NULL, 'S' },
 #if (LIBUSB_API_VERSION >= 0x01000107)
@@ -298,6 +306,7 @@ static int print_usage(void)
         "--exact,    -e - exact location (no USB3 duality handling).\n"
         "--force,    -f - force operation even on unsupported hubs.\n"
         "--nodesc,   -N - do not query device description (helpful for unresponsive devices).\n"
+        "--json,     -j - print status as JSON.\n"
 #if defined(__linux__)
         "--nosysfs,  -S - do not use the Linux sysfs port disable interface.\n"
 #if (LIBUSB_API_VERSION >= 0x01000107)
@@ -782,6 +791,16 @@ static int set_port_status(struct libusb_device_handle *devh, struct hub_info *h
 }
 
 
+static const char *lpsm_name(int lpsm)
+{
+    if (lpsm == HUB_CHAR_INDV_PORT_LPSM)
+        return "ppps";
+    if (lpsm == HUB_CHAR_COMMON_LPSM)
+        return "ganged";
+    return "nops";
+}
+
+
 /*
  * Get USB device descriptor strings and summary description.
  *
@@ -811,6 +830,8 @@ static int get_device_description(struct libusb_device * dev, struct descriptor_
     memset(ds, 0, sizeof(*ds));
     id_vendor  = desc.idVendor;
     id_product = desc.idProduct;
+    ds->vid = id_vendor;
+    ds->pid = id_product;
     rc = libusb_open(dev, &devh);
     if (rc == 0) {
         if (!opt_nodesc) {
@@ -835,16 +856,12 @@ static int get_device_description(struct libusb_device * dev, struct descriptor_
             memset(&info, 0, sizeof(info));
             rc = get_hub_info(dev, &info);
             if (rc == 0) {
-                const char * lpsm_type;
-                if (info.lpsm == HUB_CHAR_INDV_PORT_LPSM) {
-                    lpsm_type = "ppps";
-                } else if (info.lpsm == HUB_CHAR_COMMON_LPSM) {
-                    lpsm_type = "ganged";
-                } else {
-                    lpsm_type = "nops";
-                }
+                ds->is_hub  = 1;
+                ds->bcd_usb = info.bcd_usb;
+                ds->nports  = info.nports;
+                ds->lpsm    = info.lpsm;
                 snprintf(hub_specific, sizeof(hub_specific), ", USB %x.%02x, %d ports, %s",
-                   info.bcd_usb >> 8, info.bcd_usb & 0xFF, info.nports, lpsm_type);
+                   info.bcd_usb >> 8, info.bcd_usb & 0xFF, info.nports, lpsm_name(info.lpsm));
             }
         }
         libusb_close(devh);
@@ -861,19 +878,144 @@ static int get_device_description(struct libusb_device * dev, struct descriptor_
 }
 
 
+/* Max number of flags returned by port_flags() */
+#define MAX_PORT_FLAGS 12
+
 /*
- * show status for hub ports
- * portmask is bitmap of ports to display
- * if portmask is 0, show all ports
+ * Decode port status bits into short names such as "power" or "connect".
+ * Returns number of names stored in flags.
  */
 
-static int print_port_status(struct hub_info * hub, int portmask)
+static int port_flags(const struct hub_info *hub, int port_status, const char *flags[MAX_PORT_FLAGS])
 {
-    int port_status;
-    struct libusb_device_handle * devh = NULL;
-    int rc = 0;
-    struct libusb_device *dev = hub->dev;
-    rc = libusb_open(dev, &devh);
+    int n = 0;
+    if (!hub->super_speed) {
+        if (port_status == 0) {
+            flags[n++] = "off";
+        } else {
+            if (port_status & USB_PORT_STAT_POWER)        flags[n++] = "power";
+            if (port_status & USB_PORT_STAT_INDICATOR)    flags[n++] = "indicator";
+            if (port_status & USB_PORT_STAT_TEST)         flags[n++] = "test";
+            if (port_status & USB_PORT_STAT_HIGH_SPEED)   flags[n++] = "highspeed";
+            if (port_status & USB_PORT_STAT_LOW_SPEED)    flags[n++] = "lowspeed";
+            if (port_status & USB_PORT_STAT_SUSPEND)      flags[n++] = "suspend";
+        }
+    } else {
+        if (!(port_status & USB_SS_PORT_STAT_POWER)) {
+            flags[n++] = "off";
+        } else {
+            flags[n++] = "power";
+            if ((port_status & USB_SS_PORT_STAT_SPEED) == USB_PORT_STAT_SPEED_5GBPS)
+                flags[n++] = "5gbps";
+            switch (port_status & USB_PORT_STAT_LINK_STATE) {
+            case USB_SS_PORT_LS_U0:          flags[n++] = "U0";          break;
+            case USB_SS_PORT_LS_U1:          flags[n++] = "U1";          break;
+            case USB_SS_PORT_LS_U2:          flags[n++] = "U2";          break;
+            case USB_SS_PORT_LS_U3:          flags[n++] = "U3";          break;
+            case USB_SS_PORT_LS_SS_DISABLED: flags[n++] = "SS.Disabled"; break;
+            case USB_SS_PORT_LS_RX_DETECT:   flags[n++] = "Rx.Detect";   break;
+            case USB_SS_PORT_LS_SS_INACTIVE: flags[n++] = "SS.Inactive"; break;
+            case USB_SS_PORT_LS_POLLING:     flags[n++] = "Polling";     break;
+            case USB_SS_PORT_LS_RECOVERY:    flags[n++] = "Recovery";    break;
+            case USB_SS_PORT_LS_HOT_RESET:   flags[n++] = "HotReset";    break;
+            case USB_SS_PORT_LS_COMP_MOD:    flags[n++] = "Compliance";  break;
+            case USB_SS_PORT_LS_LOOPBACK:    flags[n++] = "Loopback";    break;
+            }
+        }
+    }
+    if (port_status & USB_PORT_STAT_RESET)       flags[n++] = "reset";
+    if (port_status & USB_PORT_STAT_OVERCURRENT) flags[n++] = "oc";
+    if (port_status & USB_PORT_STAT_ENABLE)      flags[n++] = "enable";
+    if (port_status & USB_PORT_STAT_CONNECTION)  flags[n++] = "connect";
+    return n;
+}
+
+
+/*
+ * Find the device attached to given hub port and get its description.
+ * Returns 1 if found and 0 otherwise.
+ */
+
+static int get_port_device(const struct hub_info *hub, int port, struct descriptor_strings *ds)
+{
+    struct libusb_device *udev;
+    int i = 0;
+    while ((udev = usb_devs[i++]) != NULL) {
+        uint8_t dev_pn[MAX_HUB_CHAIN];
+        /* only match devices on the same bus: */
+        if (libusb_get_bus_number(udev) != hub->bus) continue;
+        int dev_plen = get_port_numbers(udev, dev_pn, sizeof(dev_pn));
+        if ((dev_plen == hub->pn_len + 1) &&
+            (memcmp(hub->port_numbers, dev_pn, hub->pn_len) == 0) &&
+            libusb_get_port_number(udev) == port)
+        {
+            if (get_device_description(udev, ds) == 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+
+/* print string as JSON string literal */
+
+static void json_string(const char *str)
+{
+    putchar('"');
+    for (; *str; str++) {
+        unsigned char c = (unsigned char)*str;
+        if (c == '"' || c == '\\')
+            printf("\\%c", c);
+        else if (c < 0x20)
+            printf("\\u%04x", c);
+        else
+            putchar(c);
+    }
+    putchar('"');
+}
+
+static void json_device(const struct descriptor_strings *ds)
+{
+    printf("{\"vid\":\"%04x\",\"pid\":\"%04x\",\"vendor\":", ds->vid, ds->pid);
+    json_string(ds->vendor);
+    printf(",\"product\":");
+    json_string(ds->product);
+    printf(",\"serial\":");
+    json_string(ds->serial);
+    printf(",\"description\":");
+    json_string(ds->description);
+    if (ds->is_hub) {
+        printf(",\"hub\":{\"usb_version\":\"%x.%02x\",\"nports\":%d,\"power_switching\":\"%s\"}",
+            ds->bcd_usb >> 8, ds->bcd_usb & 0xFF, ds->nports, lpsm_name(ds->lpsm));
+    }
+    putchar('}');
+}
+
+
+/*
+ * Show status for hub ports, as text under given title ("Current" or "New"),
+ * or as one JSON hub object if --json is used.
+ * portmask is bitmap of ports to display, if portmask is 0, show all ports.
+ */
+
+static int print_hub_status(struct hub_info *hub, int portmask, const char *title)
+{
+    struct libusb_device_handle *devh = NULL;
+    int nports_shown = 0;
+
+    if (opt_json) {
+        printf("{\"location\":");
+        json_string(hub->location);
+        printf(",\"super_speed\":%s,\"container_id\":", hub->super_speed ? "true" : "false");
+        json_string(hub->container_id);
+        printf(",\"device\":");
+        json_device(&hub->ds);
+        printf(",\"ports\":[");
+    } else {
+        printf("%s status for hub %s [%s]\n", title, hub->location, hub->ds.description);
+    }
+
+    int rc = libusb_open(hub->dev, &devh);
     if (rc != 0) {
         fprintf(stderr, "Cannot open hub %s: %s\n", hub->location, libusb_error_name(rc));
     } else {
@@ -881,7 +1023,7 @@ static int print_port_status(struct hub_info * hub, int portmask)
         for (port = 1; port <= hub->nports; port++) {
             if (portmask > 0 && (portmask & (1 << (port-1))) == 0) continue;
 
-            port_status = get_port_status(devh, port);
+            int port_status = get_port_status(devh, port);
             if (port_status < 0) {
                 fprintf(stderr,
                     "Cannot read port %d status: %s\n",
@@ -889,77 +1031,39 @@ static int print_port_status(struct hub_info * hub, int portmask)
                 break;
             }
 
-            printf("  Port %d: %04x", port, port_status);
-
+            const char *flags[MAX_PORT_FLAGS];
+            int nflags = port_flags(hub, port_status, flags);
             struct descriptor_strings ds;
-            memset(&ds, 0, sizeof(ds));
-            struct libusb_device * udev;
-            int i = 0;
-            while ((udev = usb_devs[i++]) != NULL) {
-                uint8_t dev_bus;
-                uint8_t dev_pn[MAX_HUB_CHAIN];
-                int dev_plen;
-                dev_bus = libusb_get_bus_number(udev);
-                /* only match devices on the same bus: */
-                if (dev_bus != hub->bus) continue;
-                dev_plen = get_port_numbers(udev, dev_pn, sizeof(dev_pn));
-                if ((dev_plen == hub->pn_len + 1) &&
-                    (memcmp(hub->port_numbers, dev_pn, hub->pn_len) == 0) &&
-                    libusb_get_port_number(udev) == port)
-                {
-                    rc = get_device_description(udev, &ds);
-                    if (rc == 0)
-                        break;
-                }
-            }
+            int has_device = (port_status & USB_PORT_STAT_CONNECTION) &&
+                             get_port_device(hub, port, &ds);
+            int f;
 
-            if (!hub->super_speed) {
-                if (port_status == 0) {
-                    printf(" off");
-                } else {
-                    if (port_status & USB_PORT_STAT_POWER)        printf(" power");
-                    if (port_status & USB_PORT_STAT_INDICATOR)    printf(" indicator");
-                    if (port_status & USB_PORT_STAT_TEST)         printf(" test");
-                    if (port_status & USB_PORT_STAT_HIGH_SPEED)   printf(" highspeed");
-                    if (port_status & USB_PORT_STAT_LOW_SPEED)    printf(" lowspeed");
-                    if (port_status & USB_PORT_STAT_SUSPEND)      printf(" suspend");
+            if (opt_json) {
+                printf("%s{\"port\":%d,\"status\":%d,\"flags\":[",
+                    nports_shown++ ? "," : "", port, port_status);
+                for (f = 0; f < nflags; f++) {
+                    if (f) putchar(',');
+                    json_string(flags[f]);
                 }
+                printf("],\"device\":");
+                if (has_device)
+                    json_device(&ds);
+                else
+                    printf("null");
+                putchar('}');
             } else {
-                if (!(port_status & USB_SS_PORT_STAT_POWER)) {
-                    printf(" off");
-                } else {
-                    int link_state = port_status & USB_PORT_STAT_LINK_STATE;
-                    if (port_status & USB_SS_PORT_STAT_POWER)     printf(" power");
-                    if ((port_status & USB_SS_PORT_STAT_SPEED)
-                         == USB_PORT_STAT_SPEED_5GBPS)
-                    {
-                        printf(" 5gbps");
-                    }
-                    if (link_state == USB_SS_PORT_LS_U0)          printf(" U0");
-                    if (link_state == USB_SS_PORT_LS_U1)          printf(" U1");
-                    if (link_state == USB_SS_PORT_LS_U2)          printf(" U2");
-                    if (link_state == USB_SS_PORT_LS_U3)          printf(" U3");
-                    if (link_state == USB_SS_PORT_LS_SS_DISABLED) printf(" SS.Disabled");
-                    if (link_state == USB_SS_PORT_LS_RX_DETECT)   printf(" Rx.Detect");
-                    if (link_state == USB_SS_PORT_LS_SS_INACTIVE) printf(" SS.Inactive");
-                    if (link_state == USB_SS_PORT_LS_POLLING)     printf(" Polling");
-                    if (link_state == USB_SS_PORT_LS_RECOVERY)    printf(" Recovery");
-                    if (link_state == USB_SS_PORT_LS_HOT_RESET)   printf(" HotReset");
-                    if (link_state == USB_SS_PORT_LS_COMP_MOD)    printf(" Compliance");
-                    if (link_state == USB_SS_PORT_LS_LOOPBACK)    printf(" Loopback");
-                }
+                printf("  Port %d: %04x", port, port_status);
+                for (f = 0; f < nflags; f++)
+                    printf(" %s", flags[f]);
+                if (port_status & USB_PORT_STAT_CONNECTION)
+                    printf(" [%s]", has_device ? ds.description : "");
+                printf("\n");
             }
-            if (port_status & USB_PORT_STAT_RESET)       printf(" reset");
-            if (port_status & USB_PORT_STAT_OVERCURRENT) printf(" oc");
-            if (port_status & USB_PORT_STAT_ENABLE)      printf(" enable");
-            if (port_status & USB_PORT_STAT_CONNECTION)  printf(" connect");
-
-            if (port_status & USB_PORT_STAT_CONNECTION)  printf(" [%s]", ds.description);
-
-            printf("\n");
         }
         libusb_close(devh);
     }
+    if (opt_json)
+        printf("]}");
     return 0;
 }
 
@@ -1254,6 +1358,9 @@ int main(int argc, char *argv[])
         case 'N':
             opt_nodesc = 1;
             break;
+        case 'j':
+            opt_json = 1;
+            break;
 #if defined(__linux__)
         case 'S':
             opt_nosysfs = 1;
@@ -1365,8 +1472,25 @@ int main(int argc, char *argv[])
         exit(1);
     }
     int failed = 0; /* set if any port could not be switched */
+    int i;
+    if (opt_json) {
+        /* {"hubs":[status before action], "steps":[{"power":..., "hubs":[status after]}]} */
+        int n = 0;
+        printf("{\"hubs\":[");
+        for (i=0; i<hub_count; i++) {
+            if (hubs[i].actionable == 0)
+                continue;
+            if (n++) putchar(',');
+            print_hub_status(&hubs[i], opt_ports, "Current");
+        }
+        printf("]");
+        if (opt_action != POWER_KEEP)
+            printf(",\"steps\":[");
+    }
     int k; /* k=0 for power OFF, k=1 for power ON */
     for (k=0; k<2; k++) { /* up to 2 power actions - off/on */
+        if (opt_json && opt_action == POWER_KEEP)
+            break; /* status was already printed */
         if (k == 0 && opt_action == POWER_ON )
             continue;
         if (k == 1 && opt_action == POWER_OFF)
@@ -1376,14 +1500,17 @@ int main(int argc, char *argv[])
         /* if toggle requested, do it only once when `k == 0` */
         if (k == 1 && opt_action == POWER_TOGGLE)
             continue;
-        int i;
+        int step_hubs = 0;
+        if (opt_json) {
+            int step_on = (opt_action == POWER_FLASH) ? !k : k;
+            printf("%s{\"power\":\"%s\",\"hubs\":[", k == 1 && opt_action != POWER_ON ? "," : "",
+                opt_action == POWER_TOGGLE ? "toggle" : step_on ? "on" : "off");
+        }
         for (i=0; i<hub_count; i++) {
             if (hubs[i].actionable == 0)
                 continue;
-            printf("Current status for hub %s [%s]\n",
-                hubs[i].location, hubs[i].ds.description
-            );
-            print_port_status(&hubs[i], opt_ports);
+            if (!opt_json)
+                print_hub_status(&hubs[i], opt_ports, "Current");
             if (opt_action == POWER_KEEP) { /* no action, show status */
                 continue;
             }
@@ -1427,26 +1554,36 @@ int main(int argc, char *argv[])
                 /* USB3 hubs need extra delay to actually turn off: */
                 if (k==0 && hubs[i].super_speed)
                     sleep_ms(150);
-                printf("Sent power %s request\n", should_be_on ? "on" : "off");
-                printf("New status for hub %s [%s]\n",
-                    hubs[i].location, hubs[i].ds.description
-                );
-                print_port_status(&hubs[i], opt_ports);
+                if (opt_json) {
+                    if (step_hubs++) putchar(',');
+                } else {
+                    printf("Sent power %s request\n", should_be_on ? "on" : "off");
+                }
+                print_hub_status(&hubs[i], opt_ports, "New");
 
                 if (k == 1 && opt_reset == 1) {
-                    printf("Resetting hub...\n");
+                    if (!opt_json)
+                        printf("Resetting hub...\n");
                     rc = libusb_reset_device(devh);
                     if (rc < 0) {
                         fprintf(stderr, "Reset failed: %s\n", libusb_error_name(rc));
-                    } else {
+                    } else if (!opt_json) {
                         printf("Reset successful!\n");
                     }
                 }
             }
             libusb_close(devh);
         }
+        if (opt_json)
+            printf("]}");
+        fflush(stdout);
         if (k == 0 && (opt_action == POWER_CYCLE || opt_action == POWER_FLASH))
             sleep_ms((int)(opt_delay * 1000));
+    }
+    if (opt_json) {
+        if (opt_action != POWER_KEEP)
+            putchar(']');
+        printf("}\n");
     }
     rc = failed ? 1 : 0;
 cleanup:

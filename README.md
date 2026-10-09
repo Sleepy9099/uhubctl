@@ -250,6 +250,24 @@ are port numbers for all hubs in chain, starting from root hub for a given USB b
 This address is semi-stable - it will not change if you unplug/replug (or turn off/on)
 USB device into the same physical USB port (this method is also used in Linux kernel).
 
+For scripts, add `-j` (`--json`) to get machine-readable output on stdout:
+
+    uhubctl -j
+    uhubctl -j -l 1-1 -p 2 -a cycle
+
+The result is a single JSON object. `hubs` lists hub status before any action,
+and `steps` (present only with `-a`) lists hub status after each power step:
+
+    {"hubs":[{"location":"1-1","super_speed":false,"container_id":"...",
+              "device":{"vid":"2109","pid":"2817","vendor":"VIA Labs, Inc.","product":"USB2.0 Hub",
+                        "serial":"","description":"...",
+                        "hub":{"usb_version":"2.10","nports":4,"power_switching":"ppps"}},
+              "ports":[{"port":2,"status":1283,"flags":["power","highspeed","enable","connect"],
+                        "device":{"vid":"154b","pid":"1009",...}}]}],
+     "steps":[{"power":"off","hubs":[...]},{"power":"on","hubs":[...]}]}
+
+Errors go to stderr, and the exit status is non-zero if any port could not be switched.
+
 
 Linux USB permissions
 =====================
