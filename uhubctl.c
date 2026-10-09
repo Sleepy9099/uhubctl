@@ -1289,7 +1289,7 @@ int main(int argc, char *argv[])
     int c = 0;
     int option_index = 0;
 #if defined(__linux__) && (LIBUSB_API_VERSION >= 0x01000107)
-    int sys_fd;
+    int sys_fd = -1;
     libusb_device_handle *sys_devh = NULL;
 #endif
 
